@@ -15,8 +15,9 @@ drn7oow74uhzhjjwl5xasnp6          120-bit
 - Lowercase base32 output. It is safe in URLs, file names, and database keys with no escape characters
 - One ID has one string form, and one string has one meaning
 - `ID` is comparable. You can use `==` on it, and you can use it as a map key
-- Text and JSON support through `encoding.TextMarshaler`
+- Text, binary, JSON, and `database/sql` support
 - No panics on input from a caller. Every failure returns an error
+- `New40`, `New80`, `New120`, and `New160` cannot fail, so they return no error
 - Pack many IDs of one size into a single string
 
 ## Installation
@@ -29,22 +30,34 @@ go get github.com/chrj/sid
 
 ### Generate an ID
 
-Pass the size you want to `New`:
+For a size that is fixed in code, call the constructor for that size. These four functions cannot fail, so they return no error:
 
 ```go
-id, err := sid.New(sid.Size80)
-if err != nil {
-    return err
-}
+id := sid.New80()
 
 fmt.Println(id) // mf7vt2hjcpx6qw4d
 ```
 
-`New` returns an error only when the size is not one of the four constants. For a size that is fixed in code, use `MustNew`:
+`New40`, `New120`, and `New160` work the same way.
+
+### Generate an ID of a configured size
+
+`Size` reads from text, so it can come from a configuration file or a flag. Read the size once at startup, then pass it to `New`:
 
 ```go
-var nodeID = sid.MustNew(sid.Size80)
+type Config struct {
+    IDSize sid.Size `json:"id_size"` // "80-bit"
+}
+
+id, err := sid.New(cfg.IDSize)
+if err != nil {
+    return err
+}
 ```
+
+`ParseSize` does the same for a flag or an environment variable. It accepts `"80"` and `"80-bit"`.
+
+`New` returns an error only when the size is not one of the four constants.
 
 ### Parse an ID
 
@@ -92,6 +105,35 @@ b, err := json.Marshal(u)
 
 A JSON `null`, a missing field, and an empty string all decode to the zero ID. Any other invalid value returns an error.
 
+### Store an ID in a database
+
+`ID` implements `driver.Valuer` and `sql.Scanner`. The column holds the string form. The zero ID becomes SQL `NULL`:
+
+```go
+_, err := db.Exec("insert into users (id, name) values ($1, $2)", id, "Alice")
+
+var got sid.ID
+err = db.QueryRow("select id from users where name = $1", "Alice").Scan(&got)
+```
+
+For a column that holds the raw bytes, use `Bytes` and `FromBytes`:
+
+```go
+b := id.Bytes()      // 10 bytes for an 80-bit ID
+
+back, err := sid.FromBytes(b)
+```
+
+### Sort IDs
+
+`Compare` orders IDs by their raw bytes:
+
+```go
+slices.SortFunc(ids, sid.ID.Compare)
+```
+
+The order follows the bytes, not the characters. The base32 alphabet puts `a-z` before `2-7`, so the order does not match the order of the string forms.
+
 ### Pack many IDs into one string
 
 All IDs must have the same size, because the decoder splits on a fixed width:
@@ -130,15 +172,15 @@ Use `Size40` only where a collision is cheap to detect, such as a short code beh
 
 ## Errors
 
-| Type             | Cause                                                        |
-|------------------|--------------------------------------------------------------|
-| `SizeError`      | The size is not one of the four constants                     |
-| `ParseError`     | The string has the wrong length or holds an invalid character |
+| Type             | Cause                                                         |
+|------------------|---------------------------------------------------------------|
+| `SizeError`      | The size, in bytes, is not one of the four supported lengths   |
+| `ParseError`     | The string has the wrong length or holds an invalid character  |
 | `MixedSizeError` | `EncodeMultiple` received IDs of more than one size            |
 
 Use `errors.As` to read the fields. `ParseError` carries the input and a `Reason` that names the rule that the input broke.
 
-Only `MustNew` and `MustParse` panic. Use them for values that are fixed in code, never for input from a caller.
+Only `MustNew` and `MustParse` panic. Use them for values that are fixed in code, never for input from a caller. The four fixed-size constructors never panic and never fail.
 
 ## License
 
