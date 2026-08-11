@@ -1,8 +1,13 @@
 package sid
 
 import (
+	"database/sql"
+	"database/sql/driver"
+	"encoding"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -171,8 +176,8 @@ func TestNewUnsupportedSize(t *testing.T) {
 		t.Fatalf("New(7) error is %T, want *SizeError", err)
 	}
 
-	if got, want := sizeErr.Size, Size(7); got != want {
-		t.Errorf("SizeError.Size = %v, want %v", got, want)
+	if got, want := sizeErr.Bytes, 7; got != want {
+		t.Errorf("SizeError.Bytes = %d, want %d", got, want)
 	}
 
 	const want = "sid: unsupported size (7 bytes): use Size40, Size80, Size120, or Size160"
@@ -670,4 +675,474 @@ func FuzzParse(f *testing.F) {
 			t.Errorf("re-parsing %q gave a different ID", s)
 		}
 	})
+}
+
+func TestFixedSizeConstructors(t *testing.T) {
+	tests := []struct {
+		name string
+		new  func() ID
+		want Size
+	}{
+		{"New40", New40, Size40},
+		{"New80", New80, Size80},
+		{"New120", New120, Size120},
+		{"New160", New160, Size160},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := tt.new()
+
+			if got := id.Size(); got != tt.want {
+				t.Errorf("Size() = %v, want %v", got, tt.want)
+			}
+
+			if id.IsZero() {
+				t.Error("IsZero() = true, want false")
+			}
+
+			if got, want := len(id.String()), tt.want.EncodedLen(); got != want {
+				t.Errorf("len(String()) = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestFromBytes(t *testing.T) {
+	t.Run("reverses Bytes", func(t *testing.T) {
+		for _, size := range allSizes {
+			t.Run(size.String(), func(t *testing.T) {
+				id := MustNew(size)
+
+				back, err := FromBytes(id.Bytes())
+				if err != nil {
+					t.Fatalf("FromBytes returned error: %v", err)
+				}
+
+				if back != id {
+					t.Errorf("FromBytes(Bytes()) = %v, want %v", back, id)
+				}
+			})
+		}
+	})
+
+	t.Run("known bytes", func(t *testing.T) {
+		id, err := FromBytes([]byte{0x00, 0x11, 0x22, 0x33, 0x44})
+		if err != nil {
+			t.Fatalf("FromBytes returned error: %v", err)
+		}
+
+		if got, want := id.String(), "aaisem2e"; got != want {
+			t.Errorf("String() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("does not alias the caller slice", func(t *testing.T) {
+		b := []byte{0x00, 0x11, 0x22, 0x33, 0x44}
+
+		id, err := FromBytes(b)
+		if err != nil {
+			t.Fatalf("FromBytes returned error: %v", err)
+		}
+
+		b[0] = 0xff
+
+		if got, want := id.String(), "aaisem2e"; got != want {
+			t.Errorf("String() = %q after the caller changed the slice, want %q", got, want)
+		}
+	})
+
+	t.Run("wrong length", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			bytes []byte
+			want  int
+		}{
+			{"empty", []byte{}, 0},
+			{"seven", make([]byte, 7), 7},
+			{"old eight byte ID", make([]byte, 8), 8},
+			{"too long", make([]byte, 40), 40},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := FromBytes(tt.bytes)
+
+				var sizeErr *SizeError
+
+				if !errors.As(err, &sizeErr) {
+					t.Fatalf("error is %T, want *SizeError", err)
+				}
+
+				if sizeErr.Bytes != tt.want {
+					t.Errorf("SizeError.Bytes = %d, want %d", sizeErr.Bytes, tt.want)
+				}
+			})
+		}
+	})
+}
+
+func TestParseSize(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    Size
+		wantErr bool
+	}{
+		{"40", Size40, false},
+		{"80", Size80, false},
+		{"120", Size120, false},
+		{"160", Size160, false},
+		{"40-bit", Size40, false},
+		{"80-bit", Size80, false},
+		{"120-bit", Size120, false},
+		{"160-bit", Size160, false},
+		{"64", 0, true},
+		{"0", 0, true},
+		{"200", 0, true},
+		{"", 0, true},
+		{"eighty", 0, true},
+		{"80 bits", 0, true},
+		{"-80", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := ParseSize(tt.input)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseSize(%q) = %v, want an error", tt.input, got)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ParseSize(%q) returned error: %v", tt.input, err)
+			}
+
+			if got != tt.want {
+				t.Errorf("ParseSize(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseSizeErrorMessage(t *testing.T) {
+	_, err := ParseSize("64")
+
+	if err == nil {
+		t.Fatal("ParseSize(\"64\") returned no error, want one")
+	}
+
+	const want = `sid: cannot parse size "64": use 40, 80, 120, or 160`
+
+	if got := err.Error(); got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
+// TestSizeInConfig covers a size that arrives in a configuration file.
+func TestSizeInConfig(t *testing.T) {
+	type config struct {
+		IDSize Size `json:"id_size"`
+	}
+
+	t.Run("decodes", func(t *testing.T) {
+		var c config
+
+		if err := json.Unmarshal([]byte(`{"id_size":"120-bit"}`), &c); err != nil {
+			t.Fatalf("Unmarshal returned error: %v", err)
+		}
+
+		if c.IDSize != Size120 {
+			t.Errorf("IDSize = %v, want %v", c.IDSize, Size120)
+		}
+	})
+
+	t.Run("round trips", func(t *testing.T) {
+		b, err := json.Marshal(config{IDSize: Size80})
+		if err != nil {
+			t.Fatalf("Marshal returned error: %v", err)
+		}
+
+		const want = `{"id_size":"80-bit"}`
+
+		if got := string(b); got != want {
+			t.Errorf("Marshal = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("rejects an unsupported size", func(t *testing.T) {
+		var c config
+
+		if err := json.Unmarshal([]byte(`{"id_size":"64"}`), &c); err == nil {
+			t.Error("Unmarshal returned no error, want one")
+		}
+	})
+
+	t.Run("rejects marshalling an invalid size", func(t *testing.T) {
+		if _, err := json.Marshal(config{IDSize: Size(7)}); err == nil {
+			t.Error("Marshal returned no error, want one")
+		}
+	})
+}
+
+func TestCompare(t *testing.T) {
+	t.Run("agrees with equality", func(t *testing.T) {
+		a := MustParse("aaisem2ekvthpcez")
+		b := MustParse("aaisem2ekvthpcez")
+
+		if got := a.Compare(b); got != 0 {
+			t.Errorf("Compare of equal IDs = %d, want 0", got)
+		}
+
+		c := New80()
+
+		if (a.Compare(c) == 0) != (a == c) {
+			t.Error("Compare and == disagree")
+		}
+	})
+
+	t.Run("orders by bytes", func(t *testing.T) {
+		low := MustParse("aaaaaaaa")
+		high := MustParse("77777777")
+
+		if got := low.Compare(high); got >= 0 {
+			t.Errorf("Compare(low, high) = %d, want a negative number", got)
+		}
+
+		if got := high.Compare(low); got <= 0 {
+			t.Errorf("Compare(high, low) = %d, want a positive number", got)
+		}
+	})
+
+	t.Run("orders a shared prefix by size", func(t *testing.T) {
+		short := MustParse("aaisem2e")
+		long := MustParse("aaisem2eaaaaaaaa")
+
+		if got := short.Compare(long); got >= 0 {
+			t.Errorf("Compare(40-bit, 80-bit) = %d, want a negative number", got)
+		}
+	})
+
+	t.Run("sorts", func(t *testing.T) {
+		ids := []ID{
+			MustParse("77777777"),
+			MustParse("aaaaaaaa"),
+			MustParse("mmmmmmmm"),
+		}
+
+		slices.SortFunc(ids, ID.Compare)
+
+		want := []string{"aaaaaaaa", "mmmmmmmm", "77777777"}
+
+		for i, id := range ids {
+			if id.String() != want[i] {
+				t.Errorf("position %d = %q, want %q", i, id, want[i])
+			}
+		}
+	})
+}
+
+func TestAppendText(t *testing.T) {
+	id := MustParse("aaisem2ekvthpcez")
+
+	got, err := id.AppendText([]byte("id="))
+	if err != nil {
+		t.Fatalf("AppendText returned error: %v", err)
+	}
+
+	const want = "id=aaisem2ekvthpcez"
+
+	if string(got) != want {
+		t.Errorf("AppendText = %q, want %q", got, want)
+	}
+
+	t.Run("zero ID appends nothing", func(t *testing.T) {
+		got, err := ID{}.AppendText([]byte("id="))
+		if err != nil {
+			t.Fatalf("AppendText returned error: %v", err)
+		}
+
+		if string(got) != "id=" {
+			t.Errorf("AppendText = %q, want %q", got, "id=")
+		}
+	})
+}
+
+func TestBinary(t *testing.T) {
+	t.Run("round trip", func(t *testing.T) {
+		for _, size := range allSizes {
+			t.Run(size.String(), func(t *testing.T) {
+				id := MustNew(size)
+
+				b, err := id.MarshalBinary()
+				if err != nil {
+					t.Fatalf("MarshalBinary returned error: %v", err)
+				}
+
+				if len(b) != int(size) {
+					t.Errorf("len = %d, want %d", len(b), int(size))
+				}
+
+				var back ID
+
+				if err := back.UnmarshalBinary(b); err != nil {
+					t.Fatalf("UnmarshalBinary returned error: %v", err)
+				}
+
+				if back != id {
+					t.Errorf("UnmarshalBinary = %v, want %v", back, id)
+				}
+			})
+		}
+	})
+
+	t.Run("zero ID", func(t *testing.T) {
+		b, err := ID{}.MarshalBinary()
+		if err != nil {
+			t.Fatalf("MarshalBinary returned error: %v", err)
+		}
+
+		var back ID
+
+		if err := back.UnmarshalBinary(b); err != nil {
+			t.Fatalf("UnmarshalBinary returned error: %v", err)
+		}
+
+		if !back.IsZero() {
+			t.Errorf("UnmarshalBinary = %v, want the zero ID", back)
+		}
+	})
+
+	t.Run("append", func(t *testing.T) {
+		id := MustParse("aaisem2e")
+
+		got, err := id.AppendBinary([]byte{0xaa})
+		if err != nil {
+			t.Fatalf("AppendBinary returned error: %v", err)
+		}
+
+		want := []byte{0xaa, 0x00, 0x11, 0x22, 0x33, 0x44}
+
+		if string(got) != string(want) {
+			t.Errorf("AppendBinary = % x, want % x", got, want)
+		}
+	})
+
+	t.Run("wrong length", func(t *testing.T) {
+		var id ID
+
+		if err := id.UnmarshalBinary(make([]byte, 8)); err == nil {
+			t.Error("UnmarshalBinary returned no error, want one")
+		}
+	})
+}
+
+func TestSQL(t *testing.T) {
+	t.Run("round trip", func(t *testing.T) {
+		id := MustNew(Size80)
+
+		v, err := id.Value()
+		if err != nil {
+			t.Fatalf("Value returned error: %v", err)
+		}
+
+		if got, want := v, driver.Value(id.String()); got != want {
+			t.Errorf("Value = %v, want %v", got, want)
+		}
+
+		var back ID
+
+		if err := back.Scan(v); err != nil {
+			t.Fatalf("Scan returned error: %v", err)
+		}
+
+		if back != id {
+			t.Errorf("Scan = %v, want %v", back, id)
+		}
+	})
+
+	t.Run("zero ID becomes NULL", func(t *testing.T) {
+		v, err := ID{}.Value()
+		if err != nil {
+			t.Fatalf("Value returned error: %v", err)
+		}
+
+		if v != nil {
+			t.Errorf("Value = %v, want nil", v)
+		}
+	})
+
+	t.Run("scan", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			src     any
+			want    ID
+			wantErr bool
+		}{
+			{"null", nil, ID{}, false},
+			{"string", "aaisem2ekvthpcez", MustParse("aaisem2ekvthpcez"), false},
+			{"bytes", []byte("aaisem2ekvthpcez"), MustParse("aaisem2ekvthpcez"), false},
+			{"empty string", "", ID{}, false},
+			{"invalid string", "nope", ID{}, true},
+			{"int", 42, ID{}, true},
+			{"time", struct{}{}, ID{}, true},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var id ID
+
+				err := id.Scan(tt.src)
+
+				if tt.wantErr {
+					if err == nil {
+						t.Fatalf("Scan(%v) returned no error, want one", tt.src)
+					}
+
+					return
+				}
+
+				if err != nil {
+					t.Fatalf("Scan(%v) returned error: %v", tt.src, err)
+				}
+
+				if id != tt.want {
+					t.Errorf("Scan(%v) = %v, want %v", tt.src, id, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("scan error names the type", func(t *testing.T) {
+		var id ID
+
+		err := id.Scan(42)
+
+		const want = "sid: cannot scan int into an ID: want a string, bytes, or NULL"
+
+		if got := err.Error(); got != want {
+			t.Errorf("Error() = %q, want %q", got, want)
+		}
+	})
+}
+
+// TestInterfaces fails to compile if an interface is not satisfied.
+func TestInterfaces(t *testing.T) {
+	var (
+		_ encoding.TextMarshaler     = ID{}
+		_ encoding.TextUnmarshaler   = &ID{}
+		_ encoding.TextAppender      = ID{}
+		_ encoding.BinaryMarshaler   = ID{}
+		_ encoding.BinaryUnmarshaler = &ID{}
+		_ encoding.BinaryAppender    = ID{}
+		_ driver.Valuer              = ID{}
+		_ sql.Scanner                = &ID{}
+		_ fmt.Stringer               = ID{}
+		_ encoding.TextMarshaler     = Size80
+		_ encoding.TextUnmarshaler   = new(Size)
+		_ fmt.Stringer               = Size80
+	)
 }
