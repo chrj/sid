@@ -677,6 +677,64 @@ func FuzzParse(f *testing.F) {
 	})
 }
 
+// FuzzDecodeMultiple covers the fixed-width split that DecodeMultiple does.
+// FuzzParse reaches one segment at a time, so it cannot reach that split.
+func FuzzDecodeMultiple(f *testing.F) {
+	seeds := []struct {
+		s    string
+		size uint8
+	}{
+		{"", 5},
+		{"aaisem2e", 5},
+		{"aaisem2e77777777", 5},
+		{"aaisem2ekvthpcez", 10},
+		{"aaisem2ekvthpcezvk54zxpo", 15},
+		{"aaisem2ekvthpcezvk54zxpo74aqeaye", 20},
+		{"aaisem2e", 10},
+		{"aaisem2eAAAAAAAA", 5},
+		{"aaisem2e!", 5},
+		{"aaaaaaaa", 7},
+		{"aaaaaaaa", 0},
+	}
+
+	for _, seed := range seeds {
+		f.Add(seed.s, seed.size)
+	}
+
+	f.Fuzz(func(t *testing.T, s string, sizeByte uint8) {
+		size := Size(sizeByte)
+
+		ids, err := DecodeMultiple(s, size)
+
+		if err != nil {
+			return
+		}
+
+		if !size.Valid() {
+			t.Fatalf("DecodeMultiple(%q, %d) accepted an unsupported size", s, sizeByte)
+		}
+
+		if got, want := len(ids), len(s)/size.EncodedLen(); got != want {
+			t.Errorf("DecodeMultiple(%q, %v) gave %d IDs, want %d", s, size, got, want)
+		}
+
+		for i, id := range ids {
+			if id.Size() != size {
+				t.Errorf("ID %d of DecodeMultiple(%q, %v) has size %v", i, s, size, id.Size())
+			}
+		}
+
+		back, err := EncodeMultiple(ids)
+		if err != nil {
+			t.Fatalf("EncodeMultiple rejected the IDs from DecodeMultiple(%q, %v): %v", s, size, err)
+		}
+
+		if back != s {
+			t.Errorf("EncodeMultiple(DecodeMultiple(%q, %v)) = %q: the same IDs have two encodings", s, size, back)
+		}
+	})
+}
+
 func TestFixedSizeConstructors(t *testing.T) {
 	tests := []struct {
 		name string
