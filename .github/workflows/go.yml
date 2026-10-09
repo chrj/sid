@@ -16,7 +16,7 @@ jobs:
       matrix:
         # The first version is the go directive of go.mod, the oldest Go that
         # this module supports. The second is the current release.
-        go-version: [ "1.24", "1.27.0" ]
+        go-version: [ "1.24", "1.27.2" ]
 
     steps:
       - name: Check out code
