@@ -861,6 +861,10 @@ func TestParseSize(t *testing.T) {
 		{"eighty", 0, true},
 		{"80 bits", 0, true},
 		{"-80", 0, true},
+		// 2128 bits is 266 bytes, and 266 wraps to 10 in a byte.
+		{"2128", 0, true},
+		{"2088-bit", 0, true},
+		{"-1968", 0, true},
 	}
 
 	for _, tt := range tests {

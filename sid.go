@@ -116,7 +116,9 @@ func (s Size) String() string {
 func ParseSize(s string) (Size, error) {
 	bits, err := strconv.Atoi(strings.TrimSuffix(s, "-bit"))
 
-	if err == nil && bits%8 == 0 {
+	// Check the range before the conversion to Size, because a larger value
+	// wraps around in a byte. Without the check, 2128 bits gives Size80.
+	if err == nil && bits > 0 && bits <= maxBytes*8 && bits%8 == 0 {
 		if size := Size(bits / 8); size.Valid() {
 			return size, nil
 		}
@@ -271,7 +273,7 @@ func newID(size Size) ID {
 //
 // It returns a [SizeError] if b has any other length.
 func FromBytes(b []byte) (ID, error) {
-	size := Size(len(b))
+	size := Size(len(b)) // #nosec G115 -- the check below rejects a length above maxBytes before size is used
 
 	if len(b) > maxBytes || !size.Valid() {
 		return ID{}, &SizeError{Bytes: len(b)}
